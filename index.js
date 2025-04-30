@@ -17,9 +17,15 @@ app.use(cors());
 io.on("connection", (socket) => {
   console.log("A user connected:", socket.id);
 
-  socket.on("chat message", (msg) => {
+  socket.on("new-user-joined", (username) => {
+    console.log(username + " has joined");
+    // Optionally broadcast a "new user joined" event
+    socket.broadcast.emit("user-joined", username);
+  });
+
+  socket.on("send", (msg) => {
     // Broadcast to everyone except sender
-    socket.broadcast.emit("chat message", msg);
+    socket.broadcast.emit("receive", msg); // Ensure event names match
   });
 
   socket.on("disconnect", () => {
