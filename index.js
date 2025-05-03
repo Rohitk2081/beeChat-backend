@@ -7,27 +7,39 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // allow all origins for testing
+    origin: "*",
     methods: ["GET", "POST"]
   }
 });
 
 app.use(cors());
 
+let onlineUsers = 0;
+
 io.on("connection", (socket) => {
-  console.log("A user connected:", socket.id);
+  onlineUsers++;
+  console.log("User connected:", socket.id);
+  io.emit("user status", { online: onlineUsers > 1 });
 
   socket.on("chat message", (msg) => {
-    // Broadcast to everyone except sender
     socket.broadcast.emit("chat message", msg);
+  });
+  socket.on("chat image", (data) => {
+    socket.broadcast.emit("chat image", data);
   });
 
   socket.on("disconnect", () => {
+    onlineUsers--;
     console.log("User disconnected:", socket.id);
+    io.emit("user status", { online: onlineUsers > 1 });
   });
+});
+
+app.get("/", (req, res) => {
+  res.send("Chat backend running on localhost.");
 });
 
 const PORT = 3000;
 server.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Server running at http://localhost:${PORT}`);
 });
