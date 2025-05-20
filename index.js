@@ -1,122 +1,195 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
+// server.js - Backend for BeeChat application with MongoDB Atlas integration
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const mongoose = require('mongoose');
+const dotenv = require('dotenv');
+const cors = require('cors');
+
+// Load environment variables
+dotenv.config();
+
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  },
-  maxHttpBufferSize: 5e6 // 5MB buffer size for individual chunks
-});
 
+// Enable CORS
 app.use(cors());
 
-// Store chunks until a complete file is received
-const imageChunks = {};
-let onlineUsers = 0;
+// Initialize Socket.IO with CORS settings
+const io = new Server(server, {
+  cors: {
+    origin: "*", // Allow all origins in development
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
 
-io.on("connection", (socket) => {
-  onlineUsers++;
-  console.log("User connected:", socket.id);
-  io.emit("user status", { online: onlineUsers > 1 });
+// MongoDB Connection
+// Replace this URI with your MongoDB Atlas connection string (should be in .env file)
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://rohitkumar00n:NjeOs4EnBfzjAA1B@cluster0.hh4wozl.mongodb.net/test?retryWrites=true&w=majority&appName=Cluster0';
 
-  // Regular text messages
-  socket.on("chat message", (msg) => {
-    socket.broadcast.emit("chat message", msg);
+// Connect to MongoDB
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('Connected to MongoDB Atlas'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Define Message Schema
+const messageSchema = new mongoose.Schema({
+  user: { type: String, required: true },
+  msg: { type: String, required: false },
+  img: { type: String, required: false }, // Store base64 encoded images
+  timestamp: { type: Date, default: Date.now }
+});
+
+// Create Message model
+const Message = mongoose.model('Message', messageSchema);
+
+// Keep track of connected users and their status
+let connectedUsers = 0;
+
+// Object to store incomplete image transfers
+const imageTransfers = {};
+
+// Socket.IO connection
+io.on('connection', (socket) => {
+  console.log('A user connected');
+  connectedUsers++;
+  
+  // Broadcast to everyone that a user is online
+  io.emit('user status', { online: connectedUsers > 1 });
+  
+  // Load and send chat history when user connects
+  sendChatHistory(socket);
+  
+  // Handle chat messages
+  socket.on('chat message', async (data) => {
+    try {
+      // Save message to database
+      const newMessage = new Message({
+        user: data.user,
+        msg: data.msg
+      });
+      
+      await newMessage.save();
+      console.log('Message saved to database');
+      
+      // Broadcast message to all clients except sender
+      socket.broadcast.emit('chat message', data);
+    } catch (error) {
+      console.error('Error saving message:', error);
+    }
   });
-
-  // Legacy image handling (keep for backward compatibility)
-  socket.on("chat image", (data) => {
-    socket.broadcast.emit("chat image", data);
-  });
-
-  // Handle image metadata for chunked transfer
+  
+  // Handle image transfers
+  
+  // First: receive image metadata
   socket.on('image-metadata', (metadata) => {
     const { fileId, totalChunks, user } = metadata;
     
-    // Initialize storage for this file
-    imageChunks[fileId] = {
-      totalChunks: totalChunks,
+    // Initialize a new image transfer
+    imageTransfers[fileId] = {
       chunks: new Array(totalChunks),
       receivedChunks: 0,
+      totalChunks: totalChunks,
       user: user
     };
     
-    console.log(`Starting to receive image ${fileId} from ${user} with ${totalChunks} chunks`);
+    console.log(`Starting image transfer: ${fileId}, chunks: ${totalChunks}`);
   });
   
-  // Handle image chunks
-  socket.on('image-chunk', (data) => {
+  // Next: receive image chunks
+  socket.on('image-chunk', async (data) => {
     const { fileId, chunkIndex, chunk, last } = data;
+    const transfer = imageTransfers[fileId];
     
-    // Store the chunk
-    if (imageChunks[fileId]) {
-      imageChunks[fileId].chunks[chunkIndex] = chunk;
-      imageChunks[fileId].receivedChunks += 1;
+    // If we don't have this transfer in progress, ignore the chunk
+    if (!transfer) {
+      console.error(`Received chunk for unknown transfer: ${fileId}`);
+      return;
+    }
+    
+    // Store this chunk
+    transfer.chunks[chunkIndex] = chunk;
+    transfer.receivedChunks++;
+    
+    console.log(`Received chunk ${chunkIndex + 1}/${transfer.totalChunks} for ${fileId}`);
+    
+    // If this is the last chunk or we've received all chunks, process the image
+    if (last || transfer.receivedChunks === transfer.totalChunks) {
+      // Combine all chunks to form the complete image
+      const completeImage = transfer.chunks.join('');
       
-      // Log progress for large files
-      if (imageChunks[fileId].totalChunks > 10 && chunkIndex % 10 === 0) {
-        const progress = Math.floor((imageChunks[fileId].receivedChunks / imageChunks[fileId].totalChunks) * 100);
-        console.log(`Image ${fileId} progress: ${progress}%`);
-      }
-      
-      // Check if all chunks received
-      if (imageChunks[fileId].receivedChunks === imageChunks[fileId].totalChunks) {
-        // Combine all chunks
-        const completeImage = imageChunks[fileId].chunks.join('');
-        const user = imageChunks[fileId].user;
-        
-        // Broadcast the complete image to all clients except sender
-        socket.broadcast.emit('image-complete', {
-          fileId: fileId,
-          imageData: completeImage,
-          user: user
+      try {
+        // Save the image to database
+        const newImageMessage = new Message({
+          user: transfer.user,
+          img: completeImage
         });
         
-        // Clean up
-        delete imageChunks[fileId];
-        console.log(`Image ${fileId} from ${user} received completely and broadcast to all clients`);
+        await newImageMessage.save();
+        console.log('Image saved to database');
+        
+        // Broadcast image to all clients except sender
+        socket.broadcast.emit('image-complete', {
+          user: transfer.user,
+          imageData: completeImage
+        });
+        
+        // Clean up the transfer data
+        delete imageTransfers[fileId];
+      } catch (error) {
+        console.error('Error saving image:', error);
       }
     }
   });
-
-  socket.on("disconnect", () => {
-    onlineUsers--;
-    console.log("User disconnected:", socket.id);
-    io.emit("user status", { online: onlineUsers > 1 });
+  
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    console.log('User disconnected');
+    connectedUsers--;
     
-    // Clean up any incomplete transfers from this user
-    for (const fileId in imageChunks) {
-      if (imageChunks[fileId].socketId === socket.id) {
-        console.log(`Cleaning up incomplete transfer ${fileId} due to user disconnect`);
-        delete imageChunks[fileId];
-      }
-    }
+    // Broadcast user status update
+    io.emit('user status', { online: connectedUsers > 1 });
   });
 });
 
-// Clean up stale transfers periodically (those older than 10 minutes)
-setInterval(() => {
-  const now = Date.now();
-  for (const fileId in imageChunks) {
-    if (fileId.startsWith('img_')) {
-      const timestamp = parseInt(fileId.split('_')[1]);
-      if (now - timestamp > 10 * 60 * 1000) { // 10 minutes
-        console.log(`Cleaning up stale transfer ${fileId}`);
-        delete imageChunks[fileId];
+// Function to send chat history to newly connected users
+async function sendChatHistory(socket) {
+  try {
+    // Get the last 50 messages from the database
+    const messages = await Message.find()
+      .sort({ timestamp: -1 })
+      .limit(50)
+      .lean();
+    
+    // Send messages in chronological order
+    const chronologicalMessages = messages.reverse();
+    
+    // Send each message to the newly connected client
+    chronologicalMessages.forEach(message => {
+      if (message.msg) {
+        // Send text message
+        socket.emit('chat message', {
+          user: message.user,
+          msg: message.msg
+        });
+      } else if (message.img) {
+        // Send image message
+        socket.emit('image-complete', {
+          user: message.user,
+          imageData: message.img
+        });
       }
-    }
+    });
+    
+    console.log(`Sent ${chronologicalMessages.length} messages from history`);
+  } catch (error) {
+    console.error('Error fetching chat history:', error);
   }
-}, 5 * 60 * 1000); // Check every 5 minutes
+}
 
-app.get("/", (req, res) => {
-  res.send("Chat backend running on localhost.");
-});
-
-const PORT = 3000;
+// Start the server
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
