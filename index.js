@@ -30,7 +30,11 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://rohitkumar00n:NjeO
 
 // Connect to MongoDB
 mongoose.connect(MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB Atlas'))
+  .then(async () => {
+    console.log('Connected to MongoDB Atlas');
+    // Create index for better performance
+    await createIndexes();
+  })
   .catch(err => console.error('MongoDB connection error:', err));
 
 // Define Message Schema
@@ -41,8 +45,21 @@ const messageSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now }
 });
 
+// Add index to the schema for better performance
+messageSchema.index({ timestamp: -1 });
+
 // Create Message model
 const Message = mongoose.model('Message', messageSchema);
+
+// Function to create necessary indexes
+async function createIndexes() {
+  try {
+    await Message.createIndexes();
+    console.log('Database indexes created successfully');
+  } catch (error) {
+    console.error('Error creating indexes:', error);
+  }
+}
 
 // Keep track of connected users and their status
 let connectedUsers = 0;
@@ -156,11 +173,13 @@ io.on('connection', (socket) => {
 // Function to send chat history to newly connected users
 async function sendChatHistory(socket) {
   try {
-    // Get the last 50 messages from the database
+    // Get the last 50 messages from the database with optimized query
     const messages = await Message.find()
       .sort({ timestamp: -1 })
       .limit(50)
-      .lean();
+      .allowDiskUse(true) // Allow disk usage for large sorts
+      .lean()
+      .exec();
     
     // Send messages in chronological order
     const chronologicalMessages = messages.reverse();
@@ -185,6 +204,34 @@ async function sendChatHistory(socket) {
     console.log(`Sent ${chronologicalMessages.length} messages from history`);
   } catch (error) {
     console.error('Error fetching chat history:', error);
+    
+    // Fallback: try to get recent messages without sorting if the above fails
+    try {
+      console.log('Attempting fallback query...');
+      const fallbackMessages = await Message.find()
+        .limit(20) // Reduce limit for fallback
+        .lean()
+        .exec();
+      
+      // Send fallback messages
+      fallbackMessages.forEach(message => {
+        if (message.msg) {
+          socket.emit('chat message', {
+            user: message.user,
+            msg: message.msg
+          });
+        } else if (message.img) {
+          socket.emit('image-complete', {
+            user: message.user,
+            imageData: message.img
+          });
+        }
+      });
+      
+      console.log(`Sent ${fallbackMessages.length} messages from fallback query`);
+    } catch (fallbackError) {
+      console.error('Fallback query also failed:', fallbackError);
+    }
   }
 }
 
